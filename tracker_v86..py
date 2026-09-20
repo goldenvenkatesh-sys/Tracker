@@ -80,6 +80,20 @@ AIGFS_BASE_URL = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod"
 
 HTML_OUT = OUTPUT_DIR / "MASRAINMAN_IFS_HRES_AIFS_ENS_AIGFS_Tropical_Tracker.html"
 AIGFS_DIAG_DIR = DATA_DIR / "aigfs_diagnostics"
+
+# =============================================================================
+# GITHUB AUTO-PUBLISH
+# =============================================================================
+# The generated HTML can be published automatically to GitHub Pages.
+# SECURITY: never put the GitHub token directly in this script.
+# Set MASRAINMAN_GITHUB_TOKEN as a Windows environment variable.
+GITHUB_OWNER = os.environ.get("MASRAINMAN_GITHUB_OWNER", "goldenvenkatesh-sys")
+GITHUB_REPO = os.environ.get("MASRAINMAN_GITHUB_REPO", "Tracker")
+GITHUB_BRANCH = os.environ.get("MASRAINMAN_GITHUB_BRANCH", "main")
+GITHUB_HTML_PATH = os.environ.get("MASRAINMAN_GITHUB_HTML_PATH", "index.html")
+GITHUB_TOKEN_ENV = "MASRAINMAN_GITHUB_TOKEN"
+GITHUB_API = "https://api.github.com"
+
 AIGFS_DIAG_DIR.mkdir(parents=True, exist_ok=True)
 SST_CACHE_DIR = DATA_DIR / "sst"
 SST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1595,6 +1609,118 @@ buildProductButtons(); buildCycles(); buildHours(); updateMap();
     return HTML_OUT
 
 # =============================================================================
+# GITHUB PUBLISHER
+# =============================================================================
+
+def publish_html_to_github(html_path):
+    """Publish the generated tracker HTML to GitHub Pages.
+
+    Uses the GitHub Contents API. The token is read only from the environment,
+    never from the source code. If the remote file is already identical, no
+    commit is created.
+    """
+    token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
+    if not token:
+        print("GitHub auto-publish: DISABLED — MASRAINMAN_GITHUB_TOKEN is not set.")
+        return False
+
+    html_path = Path(html_path)
+    if not html_path.exists():
+        print(f"GitHub auto-publish: HTML file not found: {html_path}")
+        return False
+
+    content_bytes = html_path.read_bytes()
+    if len(content_bytes) >= 950_000:
+        print(f"GitHub auto-publish: WARNING — index.html is {len(content_bytes):,} bytes; Contents API has a practical size limit.")
+    encoded = base64.b64encode(content_bytes).decode("ascii")
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "MASRAINMAN-India-Tropical-Tracker",
+    }
+    api_url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_HTML_PATH}"
+
+    try:
+        # Read the current remote file so we can avoid unnecessary commits.
+        response = requests.get(
+            api_url,
+            params={"ref": GITHUB_BRANCH},
+            headers=headers,
+            timeout=30,
+        )
+
+        remote_sha = None
+        if response.status_code == 200:
+            remote = response.json()
+            remote_sha = remote.get("sha")
+            remote_content = remote.get("content", "")
+            if remote_content:
+                try:
+                    remote_bytes = base64.b64decode(
+                        remote_content.replace("\n", ""),
+                        validate=False,
+                    )
+                    if remote_bytes == content_bytes:
+                        print(
+                            f"GitHub auto-publish: NO CHANGE — "
+                            f"{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_HTML_PATH}"
+                        )
+                        return True
+                except Exception:
+                    pass
+        elif response.status_code != 404:
+            response.raise_for_status()
+
+        payload = {
+            "message": (
+                f"Auto-update tropical tracker — "
+                f"{utc_now():%Y-%m-%d %H:%M UTC}"
+            ),
+            "content": encoded,
+            "branch": GITHUB_BRANCH,
+        }
+        if remote_sha:
+            payload["sha"] = remote_sha
+
+        put_response = requests.put(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        put_response.raise_for_status()
+        result = put_response.json()
+
+        commit = result.get("commit", {})
+        commit_sha = commit.get("sha", "")
+        commit_url = commit.get("html_url", "")
+        print("GitHub auto-publish: SUCCESS")
+        print(f"  Repository : {GITHUB_OWNER}/{GITHUB_REPO}")
+        print(f"  Branch     : {GITHUB_BRANCH}")
+        print(f"  File       : {GITHUB_HTML_PATH}")
+        if commit_sha:
+            print(f"  Commit SHA : {commit_sha}")
+        if commit_url:
+            print(f"  Commit URL : {commit_url}")
+        print("  GitHub Pages will update automatically after the commit.")
+        return True
+
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            detail = f" | {exc.response.text[:500]}"
+        except Exception:
+            pass
+        print(f"GitHub auto-publish: HTTP ERROR — {exc}{detail}")
+        return False
+    except Exception as exc:
+        print(f"GitHub auto-publish: ERROR — {exc}")
+        return False
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1622,6 +1748,12 @@ def build_tracker_once():
     print(f"Latest usable IFS run : {latest_ifs}")
     print(f"Latest complete AI-GFS: {latest_aigfs} (F384 required)")
     print(f"Tracker HTML updated   : {html}")
+
+    # Publish only after the HTML has been successfully generated.
+    # The publisher compares the remote file first, so unchanged cycles
+    # do not create unnecessary GitHub commits.
+    publish_html_to_github(html)
+
     return html
 
 
@@ -1633,6 +1765,15 @@ def main():
     print("SST: NOAA OISST v2.1 — HTML overlay using strictly projected dimensions to guarantee alignment.")
     print(f"AUTO REFRESH: every {AUTO_REFRESH_HOURS} hour(s)")
     print("AI-GFS rule: only a completed cycle with F384 is accepted as a full run.")
+    print(
+        f"GitHub auto-publish target: "
+        f"{GITHUB_OWNER}/{GITHUB_REPO}@{GITHUB_BRANCH} -> {GITHUB_HTML_PATH}"
+    )
+    print(
+        "GitHub auto-publish status: "
+        + ("ENABLED" if os.environ.get(GITHUB_TOKEN_ENV, "").strip() else
+           "DISABLED — set MASRAINMAN_GITHUB_TOKEN")
+    )
 
     browser_opened = False
     while True:
@@ -1646,7 +1787,7 @@ def main():
                     print(f"Open this file manually: {html}")
 
             next_check = utc_now() + pd.Timedelta(seconds=AUTO_REFRESH_SECONDS)
-            print_banner(f"MASRAINMAN V88 READY — NEXT RUN CHECK {next_check:%d.%m.%Y %H:%M UTC}")
+            print_banner(f"MASRAINMAN AUTO MODE — NEXT RUN CHECK {next_check:%d.%m.%Y %H:%M UTC}")
             print(f"The page will auto-refresh every {AUTO_REFRESH_HOURS} hour(s).")
             print("If a new completed model cycle is available at the next check, downloading and plotting starts automatically.")
             time.sleep(AUTO_REFRESH_SECONDS)
