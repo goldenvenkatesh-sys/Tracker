@@ -1,7 +1,7 @@
 # =============================================================================
 # MASRAINMAN — INDIA TROPICAL TRACKER
-# V88 — ECMWF IFS HRES + AIFS Single + IFS ENS + NOAA AI-GFS + NOAA OISST SST
-# Auto-refresh / latest-run detection every 2 hours
+# V89 — ECMWF IFS HRES + AIFS Single + IFS ENS + NOAA AI-GFS + NOAA OISST SST
+# Auto-refresh / latest-run detection every 1 hour
 # THEME: "Turbo-Muted" Oceanic SST Palette
 # FEATURES: Capture-Phase Zoom Engine + Widescreen Aspect Ratio (Edge-to-Edge)
 # =============================================================================
@@ -51,7 +51,7 @@ from eccodes import (
 
 APP_NAME = "MASRAINMAN INDIA TROPICAL TRACKER"
 
-AUTO_REFRESH_HOURS = 2
+AUTO_REFRESH_HOURS = 1
 AUTO_REFRESH_SECONDS = AUTO_REFRESH_HOURS * 60 * 60
 
 ROOT_DIR = Path(os.environ.get("MASRAINMAN_TRACK_ROOT", r"D:\Track\MR_Tropical_Tracker"))
@@ -483,66 +483,163 @@ def _aigfs_india_land_prepared():
     except Exception: return None
 
 def choose_aigfs_low_center(lats, lons, prmsl, u10, v10, prev=None):
-    lats, lons, p = np.asarray(lats).ravel(), np.asarray(lons).ravel(), np.asarray(prmsl).ravel()
+    """Robust AI-GFS MSLP low-center detector.
+
+    The previous version could reject valid frames because it first clipped the
+    native grid and then assumed the clipped 1-D arrays could always be safely
+    reshaped.  This version reconstructs the regular grid explicitly and uses
+    progressively relaxed candidate selection so one weak/flat low does not
+    terminate the track.
+    """
+    lats = np.asarray(lats, dtype=float).ravel()
+    lons = np.asarray(lons, dtype=float).ravel()
+    p = np.asarray(prmsl, dtype=float).ravel()
     n = min(lats.size, lons.size, p.size)
+    if n == 0:
+        return None
     lats, lons, p = lats[:n], lons[:n], p[:n]
 
-    good = np.isfinite(lats) & np.isfinite(lons) & np.isfinite(p) & (lons >= TRACK_WEST) & (lons <= TRACK_EAST) & (lats >= TRACK_SOUTH) & (lats <= TRACK_NORTH)
-    if np.unique(lats[good]).size < 20: return None
+    good = (
+        np.isfinite(lats) & np.isfinite(lons) & np.isfinite(p) &
+        (lons >= TRACK_WEST) & (lons <= TRACK_EAST) &
+        (lats >= TRACK_SOUTH) & (lats <= TRACK_NORTH)
+    )
+    if good.sum() < 100:
+        return None
 
-    order = np.where(good)[0]
-    lat0, lon0, p0 = lats[order], lons[order], p[order]
-    
-    sort_idx = np.lexsort((lon0, lat0))
-    lat_s, lon_s, p_s = lat0[sort_idx], lon0[sort_idx], p0[sort_idx]
+    idx = np.where(good)[0]
+    la = lats[idx]
+    lo = lons[idx]
+    pp = p[idx]
 
+    # Explicitly rebuild the regular geographic grid from the coordinate values.
+    # This avoids relying on GRIB point ordering after domain clipping.
+    lat_vals = np.unique(np.round(la, 6))
+    lon_vals = np.unique(np.round(lo, 6))
+    if lat_vals.size < 10 or lon_vals.size < 10:
+        return None
+
+    lat_vals.sort()
+    lon_vals.sort()
+    grid = np.full((lat_vals.size, lon_vals.size), np.nan, dtype=float)
+    lat_ix = np.searchsorted(lat_vals, np.round(la, 6))
+    lon_ix = np.searchsorted(lon_vals, np.round(lo, 6))
+    grid[lat_ix, lon_ix] = pp
+
+    # Local pressure minima.  50 Pa = 0.5 hPa is deliberately modest:
+    # AI-GFS can contain broad/weak lows where a 2 hPa depth test is too strict.
     try:
-        p_grid = p_s.reshape(np.unique(lat0).size, np.unique(lon0).size)
         from scipy.ndimage import minimum_filter, maximum_filter
-        local_min = minimum_filter(p_grid, size=11, mode="nearest")
-        broad_max = maximum_filter(p_grid, size=31, mode="nearest")
-    except Exception: return None
+        local_min = minimum_filter(np.nan_to_num(grid, nan=np.nanmax(grid)), size=9, mode="nearest")
+        broad_max = maximum_filter(np.nan_to_num(grid, nan=np.nanmax(grid)), size=25, mode="nearest")
+    except Exception:
+        return None
 
-    depth = broad_max - p_grid
-    lat_grid, lon_grid = lat_s.reshape(p_grid.shape), lon_s.reshape(p_grid.shape)
+    depth = broad_max - grid
+    LAT, LON = np.meshgrid(lat_vals, lon_vals, indexing="ij")
+    valid = np.isfinite(grid)
 
-    candidate_grid = (np.isfinite(p_grid) & (p_grid <= local_min + 1e-6) & (depth >= 200.0) & (lat_grid >= TRACK_SOUTH) & (lat_grid <= TRACK_NORTH) & (lon_grid >= TRACK_WEST) & (lon_grid <= TRACK_EAST))
-    cand_flat = np.where(candidate_grid.ravel())[0]
-    if not cand_flat.size: return None
+    # Exclude the outermost grid ring where filter edge effects can create false minima.
+    valid[:2, :] = False
+    valid[-2:, :] = False
+    valid[:, :2] = False
+    valid[:, -2:] = False
 
-    cand_lat, cand_lon, cand_p, cand_depth = lat_s[cand_flat], lon_s[cand_flat], p_s[cand_flat], depth.ravel()[cand_flat]
+    candidate = valid & (grid <= local_min + 1e-6) & (depth >= 50.0)
+    cand = np.where(candidate)
+
+    # If no 0.5-hPa local minimum exists, fall back to the lowest pressure in
+    # the valid domain. This keeps the frame rather than dropping it.
+    if cand[0].size == 0:
+        flat = np.where(valid.ravel())[0]
+        if flat.size == 0:
+            return None
+        jflat = flat[np.nanargmin(grid.ravel()[flat])]
+        ci, cj = np.unravel_index(jflat, grid.shape)
+        cand_i = np.array([ci])
+        cand_j = np.array([cj])
+    else:
+        cand_i, cand_j = cand
+
+    cand_lat = LAT[cand_i, cand_j].astype(float)
+    cand_lon = LON[cand_i, cand_j].astype(float)
+    cand_p = grid[cand_i, cand_j].astype(float)
+    cand_depth = depth[cand_i, cand_j].astype(float)
+
+    # Candidate ocean mask.  Apply it preferentially for initial selection;
+    # after a track exists, continuity is more important than a perfect mask.
+    land = _aigfs_india_land_prepared()
+    ocean = np.ones(cand_lat.size, dtype=bool)
+    if land is not None:
+        try:
+            ocean = np.array([not land.covers(Point(float(lo0), float(la0)))
+                              for la0, lo0 in zip(cand_lat, cand_lon)], dtype=bool)
+        except Exception:
+            pass
 
     if prev is None:
-        initial = ((cand_lat >= 5.0) & (cand_lat <= 25.0) & (cand_lon >= 45.0) & (cand_lon <= 100.0) & (cand_p <= 101000.0))
-        land = _aigfs_india_land_prepared()
-        if land is not None and np.any(initial):
-            ocean_initial = [not land.covers(Point(float(lo), float(la))) for la, lo in zip(cand_lat[initial], cand_lon[initial])]
-            initial_idx = np.where(initial)[0]
-            keep = np.asarray(ocean_initial, dtype=bool)
-            initial[:] = False
-            initial[initial_idx[keep]] = True
+        # Prefer the tropical/subtropical oceanic belt around the Bay of Bengal,
+        # Arabian Sea and adjoining Indian Ocean, but retain a broader fallback.
+        initial = (
+            ocean & (cand_lat >= 3.0) & (cand_lat <= 28.0) &
+            (cand_lon >= 40.0) & (cand_lon <= 105.0) &
+            (cand_p <= 102000.0)
+        )
+        if not np.any(initial):
+            initial = (
+                ocean & (cand_lat >= TRACK_SOUTH) & (cand_lat <= TRACK_NORTH) &
+                (cand_lon >= TRACK_WEST) & (cand_lon <= TRACK_EAST) &
+                (cand_p <= 102500.0)
+            )
+        if not np.any(initial):
+            initial = np.ones(cand_lat.size, dtype=bool)
 
-        if not np.any(initial): return None
         ii = np.where(initial)[0]
-        bob = ii[(cand_lat[ii] >= 8.0) & (cand_lat[ii] <= 18.0) & (cand_lon[ii] >= 88.0) & (cand_lon[ii] <= 100.0)]
-        j = bob[np.argmin(cand_p[bob])] if bob.size else ii[np.argmin(cand_p[ii])]
+        # Prefer deeper lows, with a small preference for the Indian Ocean/tropics.
+        tropical_bonus = np.where(
+            (cand_lat[ii] >= 5.0) & (cand_lat[ii] <= 22.0) &
+            (cand_lon[ii] >= 55.0) & (cand_lon[ii] <= 105.0), 0.0, 500.0
+        )
+        score = cand_p[ii] + tropical_bonus - 25.0 * np.clip(cand_depth[ii], 0.0, 1000.0) / 1000.0
+        j = ii[np.argmin(score)]
     else:
         plat, plon = prev
-        distance = np.sqrt((cand_lat - plat)**2 + ((cand_lon - plon) * np.cos(np.deg2rad(plat)))**2)
-        nearby = distance <= 4.0
-        if not np.any(nearby): return None
+        distance = np.sqrt(
+            (cand_lat - plat) ** 2 +
+            ((cand_lon - plon) * np.cos(np.deg2rad(plat))) ** 2
+        )
+
+        # Normal continuity radius first, then a wider recovery radius.
+        nearby = distance <= 7.0
+        if not np.any(nearby):
+            nearby = distance <= 12.0
+        if not np.any(nearby):
+            # Do not lose the track because a weak low temporarily disappears.
+            nearby = np.ones(cand_lat.size, dtype=bool)
+
         ii = np.where(nearby)[0]
-        score = (distance[ii] / 4.0) - 0.15 * np.clip(cand_depth[ii] / 500.0, 0.0, 1.0)
+        score = (distance[ii] / 7.0) - 0.20 * np.clip(cand_depth[ii] / 500.0, 0.0, 1.0)
+        # Mild pressure preference prevents jumping to a shallow minimum at the edge.
+        score += 0.002 * np.maximum(cand_p[ii] - np.nanmin(cand_p[ii]), 0.0)
         j = ii[np.argmin(score)]
 
-    lat, lon, mslp = float(cand_lat[j]), float(cand_lon[j]), float(cand_p[j] / 100.0)
+    lat = float(cand_lat[j])
+    lon = float(cand_lon[j])
+    mslp = float(cand_p[j] / 100.0)
+
+    # Wind is sampled from the original GRIB point nearest the selected low.
     wind_kt = np.nan
     if u10 is not None and v10 is not None:
-        flat_sorted_idx = int(cand_flat[j])
-        if flat_sorted_idx < sort_idx.size:
-            original_idx = int(sort_idx[flat_sorted_idx])
-            uv = np.hypot(u10[original_idx], v10[original_idx])
-            if np.isfinite(uv): wind_kt = float(uv * 1.94384449)
+        uu = np.asarray(u10, dtype=float).ravel()[:n]
+        vv = np.asarray(v10, dtype=float).ravel()[:n]
+        if uu.size and vv.size:
+            d2 = (lats - lat) ** 2 + ((lons - lon) * np.cos(np.deg2rad(lat))) ** 2
+            d2[~np.isfinite(uu) | ~np.isfinite(vv)] = np.inf
+            k = int(np.argmin(d2))
+            if np.isfinite(d2[k]):
+                uv = np.hypot(uu[k], vv[k])
+                if np.isfinite(uv):
+                    wind_kt = float(uv * 1.94384449)
 
     return lat, lon, mslp, wind_kt
 
@@ -1037,7 +1134,7 @@ button:disabled { background:#191919; color:#555; cursor:not-allowed; }
     <div class="left">
       <b id="dataAttribution">Data attribution:</b><br>
       <span class="disclaimer">Not an official forecast or warning. For official information, follow IMD and relevant government agencies.</span><br>
-      <span id="autoRefreshStatus" style="font-size:10px;color:#777;font-weight:700;">AUTO REFRESH: EVERY 2 HOURS</span>
+      <span id="autoRefreshStatus" style="font-size:10px;color:#777;font-weight:700;">AUTO REFRESH: EVERY 1 HOUR</span>
     </div>
   </div>
 </div>
@@ -1399,9 +1496,9 @@ async function downloadFullPNG(){
 function updateAutoRefreshStatus(){
   const el = document.getElementById('autoRefreshStatus');
   if(!el) return;
-  const next = new Date(Date.now() + 2*60*60*1000);
+  const next = new Date(Date.now() + 60*60*1000);
   const ist = next.toLocaleString('en-GB',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Kolkata'});
-  el.textContent = 'AUTO REFRESH: EVERY 2 HOURS | NEXT: ' + ist + ' IST';
+  el.textContent = 'AUTO REFRESH: EVERY 1 HOUR | NEXT: ' + ist + ' IST';
 }
 updateAutoRefreshStatus();
 setInterval(updateAutoRefreshStatus, 60000);
@@ -1474,7 +1571,7 @@ def main():
     print(f"Tracking Domain: {TRACK_WEST}E–{TRACK_EAST}E / {TRACK_SOUTH}N–{TRACK_NORTH}N")
     print(f"Map Focus Domain: {MAP_WEST}E–{MAP_EAST}E / {MAP_SOUTH}N–{MAP_NORTH}N")
     print("SST: NOAA OISST v2.1 — HTML overlay using strictly projected dimensions to guarantee alignment.")
-    print(f"AUTO REFRESH: every {AUTO_REFRESH_HOURS} hours")
+    print(f"AUTO REFRESH: every {AUTO_REFRESH_HOURS} hour(s)")
     print("AI-GFS rule: only a completed cycle with F384 is accepted as a full run.")
 
     browser_opened = False
@@ -1490,7 +1587,7 @@ def main():
 
             next_check = utc_now() + pd.Timedelta(seconds=AUTO_REFRESH_SECONDS)
             print_banner(f"MASRAINMAN V88 READY — NEXT RUN CHECK {next_check:%d.%m.%Y %H:%M UTC}")
-            print(f"The page will auto-refresh every {AUTO_REFRESH_HOURS} hours.")
+            print(f"The page will auto-refresh every {AUTO_REFRESH_HOURS} hour(s).")
             print("If a new completed model cycle is available at the next check, downloading and plotting starts automatically.")
             time.sleep(AUTO_REFRESH_SECONDS)
 
@@ -1499,7 +1596,7 @@ def main():
             break
         except Exception as exc:
             print(f"\nAUTO-REFRESH ERROR: {exc}")
-            print(f"Retrying in {AUTO_REFRESH_HOURS} hours...")
+            print(f"Retrying in {AUTO_REFRESH_HOURS} hour(s)...")
             time.sleep(AUTO_REFRESH_SECONDS)
 
 if __name__ == "__main__":
