@@ -152,6 +152,9 @@ button:disabled { background:#191919; color:#555; cursor:not-allowed; }
   <div class="play"><button onclick="play()">▶ PLAY</button><button onclick="pause()">⏸ PAUSE</button></div>
   <div class="section">EXPORT</div>
   <button id="exportPngBtn" onclick="downloadFullPNG()">⬇ DOWNLOAD FULL PNG</button>
+  <div id="pointInfo" style="margin-top:8px;padding:8px;background:#fff;border:1px solid #d2b36c;border-radius:6px;color:#172033;font-size:10px;line-height:1.35;display:none;">
+    <b>SELECTED TRACK POINT</b><br><span id="pointInfoText">Click a forecast point on the map.</span>
+  </div>
   <div class="status">
     <div><b>Product:</b> <span id="productStatus">IFS HRES / Control</span></div>
     <div><b>Cycle:</b> <span id="cycleStatus"></span></div>
@@ -469,6 +472,15 @@ function updateMap() {
   const modelRunHour = String(meta.hour ?? 0).padStart(2,'0');
   const modelRunDateObj = new Date((meta.date || '1970-01-01') + 'T' + modelRunHour + ':00:00Z');
   
+  const formatPointTimes = (tau) => {
+    const valid = new Date(modelRunDateObj.getTime() + Number(tau) * 3600000);
+    const opts = {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false};
+    return {
+      ist: valid.toLocaleString('en-GB',{...opts,timeZone:'Asia/Kolkata'}),
+      utc: valid.toLocaleString('en-GB',{...opts,timeZone:'UTC'})
+    };
+  };
+
   const selectedTau=Number(hour);
   const selectedValid=new Date(modelRunDateObj.getTime()+selectedTau*3600000);
   const selectedIST=selectedValid.toLocaleString('en-GB',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Kolkata'});
@@ -504,23 +516,23 @@ function updateMap() {
       for(let i=0;i<tr.length-1;i++){
         traces.push({ type:'scattergeo',lon:[tr[i].lon,tr[i+1].lon],lat:[tr[i].lat,tr[i+1].lat],mode:'lines',line:{width:0.9,color:ensPressureClass(tr[i].mslp).color},showlegend:false,hoverinfo:'skip' });
       }
-      traces.push({ type:'scattergeo',lon:tr.map(x=>x.lon),lat:tr.map(x=>x.lat),mode:'markers', marker:{size:5.5,symbol:'circle-open',color:tr.map(x=>ensPressureClass(x.mslp).color),line:{width:0.9,color:'#333'}}, showlegend:false, customdata:tr.map(x=>[x.tau,x.member,x.mslp,x.wind_kt,ensPressureClass(x.mslp).name]), hovertemplate: '<b>'+name+'</b><br>Forecast: F%{customdata[0]}h<br>MSLP: %{customdata[2]:.0f} hPa<br>Lat: %{lat:.2f}°<br>Lon: %{lon:.2f}°<extra></extra>' });
+      traces.push({ type:'scattergeo',lon:tr.map(x=>x.lon),lat:tr.map(x=>x.lat),mode:'markers', marker:{size:5.5,symbol:'circle-open',color:tr.map(x=>ensPressureClass(x.mslp).color),line:{width:0.9,color:'#333'}}, showlegend:false, customdata:tr.map(x=>{const t=formatPointTimes(x.tau); return [x.tau,x.member,x.mslp,x.wind_kt,ensPressureClass(x.mslp).name,t.ist,t.utc]}), hovertemplate: '<b>'+name+'</b><br>Forecast: F%{customdata[0]}h<br>Valid: %{customdata[5]} IST<br>UTC: %{customdata[6]}<br>MSLP: %{customdata[2]:.0f} hPa<br>Lat: %{lat:.2f}°<br>Lon: %{lon:.2f}°<extra></extra>' });
     }else{
       for(let i=0;i<tr.length-1;i++){
         traces.push({ type:'scattergeo',lon:[tr[i].lon,tr[i+1].lon],lat:[tr[i].lat,tr[i+1].lat],mode:'lines',line:{width:3,color:classifyWind(tr[i].wind_kt).color},showlegend:false,hoverinfo:'skip' });
       }
-      traces.push({ type:'scattergeo',lon:tr.map(x=>x.lon),lat:tr.map(x=>x.lat),mode:'markers', marker:{size:8,symbol:'circle',color:tr.map(x=>classifyWind(x.wind_kt).color),line:{width:1.1,color:'#111'}}, showlegend:false, customdata:tr.map(x=>[x.tau,x.wind_kt,x.mslp,classifyWind(x.wind_kt).name]), hovertemplate: '<b>'+name+'</b><br>Intensity: %{customdata[3]}<br>Wind: %{customdata[1]:.1f} kt<br>MSLP: %{customdata[2]:.0f} hPa<br>Lat: %{lat:.2f}°<br>Lon: %{lon:.2f}°<extra></extra>' });
+      traces.push({ type:'scattergeo',lon:tr.map(x=>x.lon),lat:tr.map(x=>x.lat),mode:'markers', marker:{size:8,symbol:'circle',color:tr.map(x=>classifyWind(x.wind_kt).color),line:{width:1.1,color:'#111'}}, showlegend:false, customdata:tr.map(x=>{const t=formatPointTimes(x.tau); return [x.tau,x.wind_kt,x.mslp,classifyWind(x.wind_kt).name,t.ist,t.utc]}), hovertemplate: '<b>'+name+'</b><br>Forecast: F%{customdata[0]}h<br>Valid: %{customdata[4]} IST<br>UTC: %{customdata[5]}<br>Intensity: %{customdata[3]}<br>Wind: %{customdata[1]:.1f} kt<br>MSLP: %{customdata[2]:.0f} hPa<br>Lat: %{lat:.2f}°<br>Lon: %{lon:.2f}°<extra></extra>' });
     }
   });
 
   const current=rs.filter(x=>Math.round(Number(x.tau))===selectedTau);
   if(current.length){
     if(ens){
-      traces.push({ type:'scattergeo', lon:current.map(x=>x.lon),lat:current.map(x=>x.lat),mode:'markers', marker:{size:8,color:current.map(x=>ensPressureClass(x.mslp).color),line:{width:1.2,color:'#111'}}, showlegend:false, customdata:current.map(x=>[x.tau,x.member,x.mslp,x.wind_kt,ensPressureClass(x.mslp).name]), hovertemplate: '<b>IFS ENS Member</b><br>Forecast: F%{customdata[0]}h<br>MSLP: %{customdata[2]:.0f} hPa<extra></extra>' });
+      traces.push({ type:'scattergeo', lon:current.map(x=>x.lon),lat:current.map(x=>x.lat),mode:'markers', marker:{size:8,color:current.map(x=>ensPressureClass(x.mslp).color),line:{width:1.2,color:'#111'}}, showlegend:false, customdata:current.map(x=>{const t=formatPointTimes(x.tau); return [x.tau,x.member,x.mslp,x.wind_kt,ensPressureClass(x.mslp).name,t.ist,t.utc]}), hovertemplate: '<b>IFS ENS Member</b><br>Forecast: F%{customdata[0]}h<br>Valid: %{customdata[5]} IST<br>UTC: %{customdata[6]}<br>MSLP: %{customdata[2]:.0f} hPa<extra></extra>' });
       document.getElementById('intensityStatus').textContent=current.length+' ensemble members'; document.getElementById('intensityStatus').style.color='#1683ff';
     }else{
       const selectedColors=current.map(x=>classifyWind(x.wind_kt).color), selectedNames=current.map(x=>classifyWind(x.wind_kt).name);
-      traces.push({ type:'scattergeo', lon:current.map(x=>x.lon),lat:current.map(x=>x.lat),mode:'markers+text', text:current.map(x=>'F'+String(x.tau).padStart(3,'0')), textposition:'top center',textfont:{size:11,color:'#111'}, marker:{size:16,symbol:'circle',color:selectedColors,line:{width:2,color:'#111'}}, showlegend:false, customdata:current.map((x,i)=>[x.tau,x.wind_kt,x.mslp,selectedNames[i]]), hovertemplate: '<b>Selected Position</b><br>Intensity: %{customdata[3]}<br>Wind: %{customdata[1]:.1f} kt<extra></extra>' });
+      traces.push({ type:'scattergeo', lon:current.map(x=>x.lon),lat:current.map(x=>x.lat),mode:'markers+text', text:current.map(x=>'F'+String(x.tau).padStart(3,'0')), textposition:'top center',textfont:{size:11,color:'#111'}, marker:{size:16,symbol:'circle',color:selectedColors,line:{width:2,color:'#111'}}, showlegend:false, customdata:current.map((x,i)=>{const t=formatPointTimes(x.tau); return [x.tau,x.wind_kt,x.mslp,selectedNames[i],t.ist,t.utc]}), hovertemplate: '<b>Selected Position</b><br>Forecast: F%{customdata[0]}h<br>Valid: %{customdata[4]} IST<br>UTC: %{customdata[5]}<br>Intensity: %{customdata[3]}<br>Wind: %{customdata[1]:.1f} kt<extra></extra>' });
       document.getElementById('intensityStatus').textContent=classifyWind(current[0].wind_kt).name; document.getElementById('intensityStatus').style.color=classifyWind(current[0].wind_kt).color;
     }
   }
@@ -545,7 +557,55 @@ function updateMap() {
       bgcolor: 'rgba(0,0,0,0)'
     },
     showlegend: false
-  }, { responsive: true, displaylogo: false, scrollZoom: false, displayModeBar: false });
+  }, { responsive: true, displaylogo: false, scrollZoom: false, displayModeBar: false }).then(() => {
+    const mapEl = document.getElementById('map');
+    if(!mapEl) return;
+    mapEl.removeAllListeners('plotly_click');
+    mapEl.on('plotly_click', (ev) => {
+      if(!ev || !ev.points || !ev.points.length) return;
+      const pt = ev.points[0];
+      const cd = pt.customdata;
+      let tau = NaN, wind = NaN, mslp = NaN, intensity = '';
+      if(Array.isArray(cd)) {
+        tau = Number(cd[0]);
+        if(selectedProduct === 'ensemble') {
+          mslp = Number(cd[2]);
+          wind = Number(cd[3]);
+          intensity = ensPressureClass(mslp).name;
+        } else {
+          wind = Number(cd[1]);
+          mslp = Number(cd[2]);
+          intensity = String(cd[3] || classifyWind(wind).name);
+        }
+      } else {
+        tau = Number(cd);
+      }
+      if(!Number.isFinite(tau)) return;
+
+      const meta = RUNS[String(cycle)] || {};
+      const runHour = String(meta.hour ?? 0).padStart(2,'0');
+      const base = new Date((meta.date || '1970-01-01') + 'T' + runHour + ':00:00Z');
+      const valid = new Date(base.getTime() + tau * 3600000);
+      const fmt = (tz) => valid.toLocaleString('en-GB',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:tz});
+      const ist = fmt('Asia/Kolkata');
+      const utc = fmt('UTC');
+      const info = document.getElementById('pointInfo');
+      const text = document.getElementById('pointInfoText');
+      if(info && text) {
+        const parts = [
+          '<b>Forecast:</b> F' + String(Math.round(tau)).padStart(3,'0') + 'h',
+          '<b>Valid:</b> ' + ist + ' IST',
+          '<b>UTC:</b> ' + utc,
+          Number.isFinite(mslp) ? '<b>MSLP:</b> ' + mslp.toFixed(0) + ' hPa' : '',
+          Number.isFinite(wind) ? '<b>Wind:</b> ' + wind.toFixed(1) + ' kt' : '',
+          intensity ? '<b>Intensity:</b> ' + intensity : '',
+          Number.isFinite(pt.lat) ? '<b>Position:</b> ' + Number(pt.lat).toFixed(2) + '°N, ' + Number(pt.lon).toFixed(2) + '°E' : ''
+        ].filter(Boolean);
+        text.innerHTML = parts.join('<br>');
+        info.style.display = 'block';
+      }
+    });
+  });
 }
 
 async function downloadFullPNG(){
