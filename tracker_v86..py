@@ -1080,6 +1080,9 @@ button:disabled { background:#191919; color:#555; cursor:not-allowed; }
   <div class="play"><button onclick="play()">▶ PLAY</button><button onclick="pause()">⏸ PAUSE</button></div>
   <div class="section">EXPORT</div>
   <button id="exportPngBtn" onclick="downloadFullPNG()">⬇ DOWNLOAD FULL PNG</button>
+  <div id="pointInfo" style="margin-top:8px;padding:8px;background:#fff;border:1px solid #d2b36c;border-radius:6px;color:#172033;font-size:10px;line-height:1.35;display:none;">
+    <b>SELECTED TRACK POINT</b><br><span id="pointInfoText">Click a forecast point on the map.</span>
+  </div>
   <div class="status">
     <div><b>Product:</b> <span id="productStatus">IFS HRES / Control</span></div>
     <div><b>Cycle:</b> <span id="cycleStatus"></span></div>
@@ -1473,7 +1476,55 @@ function updateMap() {
       bgcolor: 'rgba(0,0,0,0)'
     },
     showlegend: false
-  }, { responsive: true, displaylogo: false, scrollZoom: false, displayModeBar: false });
+  }, { responsive: true, displaylogo: false, scrollZoom: false, displayModeBar: false }).then(() => {
+    const mapEl = document.getElementById('map');
+    if(!mapEl) return;
+    mapEl.removeAllListeners('plotly_click');
+    mapEl.on('plotly_click', (ev) => {
+      if(!ev || !ev.points || !ev.points.length) return;
+      const pt = ev.points[0];
+      const cd = pt.customdata;
+      let tau = NaN, wind = NaN, mslp = NaN, intensity = '';
+      if(Array.isArray(cd)) {
+        tau = Number(cd[0]);
+        if(selectedProduct === 'ensemble') {
+          mslp = Number(cd[2]);
+          wind = Number(cd[3]);
+          intensity = ensPressureClass(mslp).name;
+        } else {
+          wind = Number(cd[1]);
+          mslp = Number(cd[2]);
+          intensity = String(cd[3] || classifyWind(wind).name);
+        }
+      } else {
+        tau = Number(cd);
+      }
+      if(!Number.isFinite(tau)) return;
+
+      const meta = RUNS[String(cycle)] || {};
+      const runHour = String(meta.hour ?? 0).padStart(2,'0');
+      const base = new Date((meta.date || '1970-01-01') + 'T' + runHour + ':00:00Z');
+      const valid = new Date(base.getTime() + tau * 3600000);
+      const fmt = (tz) => valid.toLocaleString('en-GB',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:tz});
+      const ist = fmt('Asia/Kolkata');
+      const utc = fmt('UTC');
+      const info = document.getElementById('pointInfo');
+      const text = document.getElementById('pointInfoText');
+      if(info && text) {
+        const parts = [
+          '<b>Forecast:</b> F' + String(Math.round(tau)).padStart(3,'0') + 'h',
+          '<b>Valid:</b> ' + ist + ' IST',
+          '<b>UTC:</b> ' + utc,
+          Number.isFinite(mslp) ? '<b>MSLP:</b> ' + mslp.toFixed(0) + ' hPa' : '',
+          Number.isFinite(wind) ? '<b>Wind:</b> ' + wind.toFixed(1) + ' kt' : '',
+          intensity ? '<b>Intensity:</b> ' + intensity : '',
+          Number.isFinite(pt.lat) ? '<b>Position:</b> ' + Number(pt.lat).toFixed(2) + '°N, ' + Number(pt.lon).toFixed(2) + '°E' : ''
+        ].filter(Boolean);
+        text.innerHTML = parts.join('<br>');
+        info.style.display = 'block';
+      }
+    });
+  });
 }
 
 async function downloadFullPNG(){
