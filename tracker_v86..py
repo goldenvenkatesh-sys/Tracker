@@ -1,6 +1,7 @@
 # =============================================================================
 # MASRAINMAN — INDIA TROPICAL TRACKER
-# V86 — ECMWF IFS HRES + AIFS Single + IFS ENS + NOAA AI-GFS + NOAA OISST SST
+# V88 — ECMWF IFS HRES + AIFS Single + IFS ENS + NOAA AI-GFS + NOAA OISST SST
+# Auto-refresh / latest-run detection every 2 hours
 # THEME: "Turbo-Muted" Oceanic SST Palette
 # FEATURES: Capture-Phase Zoom Engine + Widescreen Aspect Ratio (Edge-to-Edge)
 # =============================================================================
@@ -8,6 +9,7 @@
 import json
 import os
 import webbrowser
+import time
 import io
 import base64
 from pathlib import Path
@@ -48,6 +50,9 @@ from eccodes import (
 # =============================================================================
 
 APP_NAME = "MASRAINMAN INDIA TROPICAL TRACKER"
+
+AUTO_REFRESH_HOURS = 2
+AUTO_REFRESH_SECONDS = AUTO_REFRESH_HOURS * 60 * 60
 
 ROOT_DIR = Path(os.environ.get("MASRAINMAN_TRACK_ROOT", r"D:\Track\MR_Tropical_Tracker"))
 DATA_DIR = ROOT_DIR / "data"
@@ -399,12 +404,17 @@ def aigfs_url_exists(url):
     except Exception: pass
     return False
 
+# AIGFS operational runs can appear before all forecast frames are published.
+# Require the final F384 frame before treating a cycle as complete.
+AIGFS_COMPLETION_HOUR = 384
+
 def find_latest_aigfs_runs(max_runs=4):
     found = []
     for run_dt in aigfs_candidate_runs(search_cycles=32):
-        if aigfs_url_exists(aigfs_file_url(run_dt, 6)):
+        if aigfs_url_exists(aigfs_file_url(run_dt, AIGFS_COMPLETION_HOUR)):
             found.append(run_dt)
-            if len(found) >= max_runs: break
+            if len(found) >= max_runs:
+                break
     return found
 
 def download_aigfs_sfc(run_dt, forecast_hour):
@@ -540,15 +550,21 @@ def load_aigfs_track(run_dt):
     rows, prev = [], None
     for fhour in range(0, AIGFS_MAX_HOURS + 1, AIGFS_STEP):
         path = download_aigfs_sfc(run_dt, fhour)
-        if path is None: break
+        if path is None:
+            print(f"  AI-GFS {run_label(run_dt)}: F{fhour:03d} unavailable — skipping frame.")
+            continue
         try:
             lats, lons, p, u10, v10 = decode_aigfs_sfc_prmsl(path)
             center = choose_aigfs_low_center(lats, lons, p, u10, v10, prev)
-            if center is None: break
+            if center is None:
+                print(f"  AI-GFS {run_label(run_dt)}: no valid low center at F{fhour:03d} — skipping frame.")
+                continue
             lat, lon, mslp, wind_kt = center
             rows.append({"storm_id": "AIGFS_LOW", "storm_name": "AI-GFS MSLP-DERIVED LOW", "member": "AI-GFS", "tau": fhour, "lat": lat, "lon": lon, "mslp": mslp, "wind_kt": wind_kt})
             prev = (lat, lon)
-        except Exception: break
+        except Exception as exc:
+            print(f"  AI-GFS {run_label(run_dt)}: decode failed at F{fhour:03d} — {exc}")
+            continue
     return pd.DataFrame(rows)
 
 # =============================================================================
@@ -817,6 +833,7 @@ def create_html(hres_data, aifs_data, ens_data, aigfs_data, hres_availability, a
 <html>
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="refresh" content="7200">
 <title>MASRAINMAN AI + IFS Tropical Tracker</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
@@ -939,6 +956,7 @@ button:disabled { background:#191919; color:#555; cursor:not-allowed; }
 .sst-cb-labels { height:100%; display:flex; flex-direction:column; justify-content:space-between; margin-left:5px; font-size:8px; color:#111; line-height:1; }
 #mapFooter { position:absolute; left:0; right:0; bottom:0; height:42px; display:flex; align-items:center; justify-content:space-between; padding:0 10px 0 16px; background:rgba(255,255,255,0.98); border-top:1px solid #d2b36c; font-size:9px; font-weight:600; line-height:1.2; color:#3e3a30; z-index:10; }
 #mapFooter .left { text-align:left; max-width:65%; }
+#dataAttribution { font-weight:800; color:#3e3a30; }
 #mapFooter .right { text-align:right; font-weight:900; color:#172033; font-size:10px; }
 #mapFooter .disclaimer { font-weight:600; color:#d12b20; }
 </style>
@@ -1017,8 +1035,9 @@ button:disabled { background:#191919; color:#555; cursor:not-allowed; }
   </div>
   <div id="mapFooter">
     <div class="left">
-      <b>Data attribution:</b> ECMWF IFS/ENS/AIFS © ECMWF, CC BY 4.0; NOAA/NCEP AI-GFS; NOAA OISST v2.1.<br>
-      <span class="disclaimer">Not an official forecast or warning. For official information, follow IMD and relevant government agencies.</span>
+      <b id="dataAttribution">Data attribution:</b><br>
+      <span class="disclaimer">Not an official forecast or warning. For official information, follow IMD and relevant government agencies.</span><br>
+      <span id="autoRefreshStatus" style="font-size:10px;color:#777;font-weight:700;">AUTO REFRESH: EVERY 2 HOURS</span>
     </div>
   </div>
 </div>
@@ -1264,6 +1283,19 @@ function updateMap() {
   document.getElementById('ensembleLegend').style.display=ens?'grid':'none';
   document.getElementById('productStatus').textContent = ens ? 'IFS ENS Multi-Member Ensemble' : (aigfs ? 'AI-GFS MSLP-Derived Low-Center Track' : (aifs ? 'AIFS Single Deterministic' : 'IFS HRES / Control Deterministic'));
 
+  const attributionEl = document.getElementById('dataAttribution');
+  if (attributionEl) {
+    if (ens) {
+      attributionEl.innerHTML = 'Data attribution: ECMWF IFS ENS © ECMWF, CC BY 4.0; NOAA/NCEI OISST v2.1.';
+    } else if (aifs) {
+      attributionEl.innerHTML = 'Data attribution: ECMWF AIFS © ECMWF, CC BY 4.0; NOAA/NCEI OISST v2.1.';
+    } else if (aigfs) {
+      attributionEl.innerHTML = 'Data attribution: NOAA/NCEP AI-GFS; NOAA/NCEI OISST v2.1.';
+    } else {
+      attributionEl.innerHTML = 'Data attribution: ECMWF IFS HRES © ECMWF, CC BY 4.0; NOAA/NCEI OISST v2.1.';
+    }
+  }
+
   const meta = RUNS[String(cycle)] || {};
   const modelRunHour = String(meta.hour ?? 0).padStart(2,'0');
   const modelRunDateObj = new Date((meta.date || '1970-01-01') + 'T' + modelRunHour + ':00:00Z');
@@ -1364,6 +1396,16 @@ async function downloadFullPNG(){
   }catch(err){ alert('Full PNG export failed.'); }finally{ btn.disabled = false; btn.classList.remove('busy'); btn.textContent = oldText; }
 }
 
+function updateAutoRefreshStatus(){
+  const el = document.getElementById('autoRefreshStatus');
+  if(!el) return;
+  const next = new Date(Date.now() + 2*60*60*1000);
+  const ist = next.toLocaleString('en-GB',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Kolkata'});
+  el.textContent = 'AUTO REFRESH: EVERY 2 HOURS | NEXT: ' + ist + ' IST';
+}
+updateAutoRefreshStatus();
+setInterval(updateAutoRefreshStatus, 60000);
+
 function play(){ if(timer!==null) return; const hs=hours(); if(!hs.length) return; timer=setInterval(()=>{ const i=hs.indexOf(hour); if(i<0 || i>=hs.length-1){ pause(); return; } hour=hs[i+1]; buildHours(); updateMap(); },700); }
 function pause(){ if(timer!==null){clearInterval(timer);timer=null;} }
 buildProductButtons(); buildCycles(); buildHours(); updateMap();
@@ -1399,25 +1441,66 @@ buildProductButtons(); buildCycles(); buildHours(); updateMap();
 # MAIN
 # =============================================================================
 
+def build_tracker_once():
+    """Check latest model availability, download new data, and rebuild HTML."""
+    check_started = utc_now()
+    print_banner(f"RUN CHECK — {check_started:%d.%m.%Y %H:%M UTC}")
+    print("Checking latest IFS / AIFS / ENS / AI-GFS run availability...")
+
+    hres_data, aifs_data, ens_data, hres_availability, aifs_availability, ens_availability, run_meta = load_cycles()
+    aigfs_data, aigfs_availability, aigfs_runs = load_aigfs(run_meta)
+    sst_data = load_latest_oisst_sst()
+
+    usable = sorted(hres_data.keys(), key=lambda x: cycle_datetime_from_key(x), reverse=True)
+    initial_cycle = usable[0] if usable else ""
+
+    html = create_html(
+        hres_data, aifs_data, ens_data, aigfs_data,
+        hres_availability, aifs_availability, ens_availability, aigfs_availability,
+        initial_cycle, run_meta, sst_data
+    )
+
+    latest_ifs = usable[0] if usable else "—"
+    latest_aigfs = run_key(aigfs_runs[0]) if aigfs_runs else "—"
+    print(f"Latest usable IFS run : {latest_ifs}")
+    print(f"Latest complete AI-GFS: {latest_aigfs} (F384 required)")
+    print(f"Tracker HTML updated   : {html}")
+    return html
+
+
 def main():
     print_banner(APP_NAME)
     print("Models: ECMWF IFS HRES + ECMWF AIFS Single + ECMWF IFS ENS + NOAA AI-GFS")
     print(f"Tracking Domain: {TRACK_WEST}E–{TRACK_EAST}E / {TRACK_SOUTH}N–{TRACK_NORTH}N")
     print(f"Map Focus Domain: {MAP_WEST}E–{MAP_EAST}E / {MAP_SOUTH}N–{MAP_NORTH}N")
     print("SST: NOAA OISST v2.1 — HTML overlay using strictly projected dimensions to guarantee alignment.")
+    print(f"AUTO REFRESH: every {AUTO_REFRESH_HOURS} hours")
+    print("AI-GFS rule: only a completed cycle with F384 is accepted as a full run.")
 
-    hres_data, aifs_data, ens_data, hres_availability, aifs_availability, ens_availability, run_meta = load_cycles()
-    aigfs_data, aigfs_availability, aigfs_runs = load_aigfs(run_meta)
-    sst_data = load_latest_oisst_sst()
-    
-    usable = sorted(hres_data.keys(), key=lambda x: cycle_datetime_from_key(x), reverse=True)
-    initial_cycle = usable[0] if usable else ""
-    
-    html = create_html(hres_data, aifs_data, ens_data, aigfs_data, hres_availability, aifs_availability, ens_availability, aigfs_availability, initial_cycle, run_meta, sst_data)
+    browser_opened = False
+    while True:
+        try:
+            html = build_tracker_once()
+            if not browser_opened:
+                try:
+                    webbrowser.open(html.resolve().as_uri())
+                    browser_opened = True
+                except Exception:
+                    print(f"Open this file manually: {html}")
 
-    print_banner("MASRAINMAN V86 TRACKER READY")
-    try: webbrowser.open(html.resolve().as_uri())
-    except Exception: print(f"Open this file manually: {html}")
+            next_check = utc_now() + pd.Timedelta(seconds=AUTO_REFRESH_SECONDS)
+            print_banner(f"MASRAINMAN V88 READY — NEXT RUN CHECK {next_check:%d.%m.%Y %H:%M UTC}")
+            print(f"The page will auto-refresh every {AUTO_REFRESH_HOURS} hours.")
+            print("If a new completed model cycle is available at the next check, downloading and plotting starts automatically.")
+            time.sleep(AUTO_REFRESH_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\nAuto-refresh stopped by user.")
+            break
+        except Exception as exc:
+            print(f"\nAUTO-REFRESH ERROR: {exc}")
+            print(f"Retrying in {AUTO_REFRESH_HOURS} hours...")
+            time.sleep(AUTO_REFRESH_SECONDS)
 
 if __name__ == "__main__":
     main()
